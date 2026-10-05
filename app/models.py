@@ -226,6 +226,26 @@ class StepRegistrationIn(BaseModel):
     volume_nl: int = Field(gt=0)
 
 
+class ActualTransferIn(BaseModel):
+    """One entry of the full, ordered actual transfer record under review."""
+    step: int = Field(ge=1)
+    source: NodeIn
+    destination: NodeIn
+    volume_nl: int = Field(gt=0)
+
+
+class ExecutionReviewIn(BaseModel):
+    """Execution-variance review submission for a finished stepwise plan.
+
+    The full actual transfer record (step number, source, destination,
+    volume for every executed transfer, strictly ordered by step number) is
+    compared against the frozen plan; the review report is sealed immutably
+    under the ``X-Review-ID`` idempotency key. A review never modifies
+    inventory, the plan or already registered steps.
+    """
+    actual_transfers: list[ActualTransferIn] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------- #
 # Response pieces
 # --------------------------------------------------------------------------- #

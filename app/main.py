@@ -17,6 +17,7 @@ from .db import (
     freeze,
     get_batch,
     get_batches,
+    get_execution_review,
     get_frozen,
     get_recall,
     get_reservation,
@@ -24,10 +25,12 @@ from .db import (
     recall_batch,
     register_step,
     reserve_and_freeze,
+    seal_execution_review,
     transition_reservation,
 )
 from .models import (
     BatchRegisterIn,
+    ExecutionReviewIn,
     InventoryPlanIn,
     PlanRequest,
     RecallIn,
@@ -42,11 +45,14 @@ from .planning import (
     frozen_transfer,
     relabel_plan,
     request_hash,
+    review_content_hash,
     stepwise_progress,
     stock_usage_from_plan,
     traced_wells_for_batch,
     traced_wells_for_executed_steps,
     transfers_match,
+    validate_actual_transfers,
+    build_execution_review,
 )
 from .solver import solve
 
@@ -60,7 +66,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microplate Dilution Planner",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Computes an exact, executable pipetting plan for microplate wells. "
         "Volumes are integer nanoliters; concentrations are rationals. "
@@ -822,3 +828,163 @@ async def abort_inventory_plan(request_id: str):
         )
     outcome, detail = await abort_stepwise(app.state.db, request_id)
     return _terminal_reply(request_id, outcome, detail, frozen[2])
+
+
+# --------------------------------------------------------------------------- #
+# Post-execution reconciliation reviews
+# --------------------------------------------------------------------------- #
+
+
+_REVIEWABLE_STATUSES = {"completed", "aborted"}
+
+
+def _review_target_error(frozen, request_id, reservation):
+    """Eligibility check for a review target.
+
+    Reviews exist only for inventory stepwise plans that have already
+    finished (``completed`` or ``aborted``). Returns a
+    ``(status_code, body)`` response tuple when the plan cannot be reviewed,
+    otherwise ``None``.
+    """
+    if frozen is None:
+        return 404, {"error": "unknown_plan",
+                     "detail": f"no frozen plan for request {request_id}"}
+    _h, fstatus, _payload = frozen
+    if fstatus != "feasible":
+        return 409, {"error": "plan_not_finished",
+                     "detail": f"request {request_id} has no feasible frozen "
+                               "plan; nothing to reconcile"}
+    if reservation is None:
+        return 409, {"error": "plan_not_finished",
+                     "detail": f"request {request_id} is not an inventory "
+                               "plan with an execution lifecycle; only "
+                               "stepwise plans can be reconciled"}
+    if reservation["mode"] != "stepwise":
+        return 409, {"error": "whole_execution_mode",
+                     "detail": f"request {request_id} was created without "
+                               "stepwise execution mode; it has no executed "
+                               "step record to reconcile",
+                     "request_id": request_id,
+                     "status": reservation["status"]}
+    if reservation["status"] not in _REVIEWABLE_STATUSES:
+        return 409, {"error": "plan_not_finished",
+                     "detail": f"request {request_id} is still "
+                               f"{reservation['status']}; reconciliation is "
+                               "only accepted after completion or abort",
+                     "request_id": request_id,
+                     "status": reservation["status"]}
+    return None
+
+
+@app.post("/inventory/plans/{request_id}/reviews")
+async def create_execution_review(
+    request_id: str,
+    req: ExecutionReviewIn,
+    review_id: str = Header(..., alias="X-Review-ID"),
+):
+    """Seal an immutable execution-variance review for a finished plan.
+
+    The request carries the full ordered record of actual transfers (step,
+    source, destination, volume); the frozen plan is compared step by step
+    and the resulting report -- per-step match results, the first
+    missing/extra/content-mismatch position, and frozen vs actual stock-out
+    totals -- is sealed under the ``X-Review-ID`` key. The review never
+    changes inventory, the plan or registered steps.
+    """
+    if not review_id or not review_id.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request",
+                     "detail": "X-Review-ID header is required"},
+        )
+    review_id = review_id.strip()
+
+    transfers = [{"step": t.step,
+                  "source": t.source.model_dump(exclude_none=False),
+                  "destination": t.destination.model_dump(exclude_none=False),
+                  "volume_nl": t.volume_nl}
+                 for t in req.actual_transfers]
+
+    # Whole-request structural rejections: never seal a report.
+    invalid = validate_actual_transfers(transfers)
+    if invalid is not None:
+        return JSONResponse(status_code=400, content=invalid)
+
+    chash = review_content_hash(request_id, transfers)
+
+    # Same review id + same content replays the original sealed report
+    # regardless of what later happened to the plan; same id + different
+    # content conflicts -- before any eligibility or freeze logic runs.
+    existing = await get_execution_review(app.state.db, review_id)
+    if existing is not None:
+        if existing.get("content_hash") == chash:
+            return JSONResponse(status_code=200, content=existing)
+        return JSONResponse(
+            status_code=409,
+            content={"error": "review_conflict",
+                     "detail": "X-Review-ID is already sealed with different "
+                               "review content",
+                     "review_id": review_id,
+                     "existing_request_id": existing.get("request_id")})
+
+    frozen = await get_frozen(app.state.db, request_id)
+    reservation = await get_reservation(app.state.db, request_id)
+    error = _review_target_error(frozen, request_id, reservation)
+    if error is not None:
+        code, body = error
+        return JSONResponse(status_code=code, content=body)
+
+    report = build_execution_review(
+        frozen[2].get("plan", {}), transfers, reservation["status"])
+    report["content_hash"] = chash
+
+    outcome, data = await seal_execution_review(
+        app.state.db, review_id, request_id, chash, report)
+    if outcome == "conflict":
+        # A concurrent request sealed the same review id first. Re-read the
+        # authoritative row: same content replays, different content
+        # conflicts.
+        winner = await get_execution_review(app.state.db, review_id)
+        if winner is not None and winner.get("content_hash") == chash:
+            return JSONResponse(status_code=200, content=winner)
+        return JSONResponse(
+            status_code=409,
+            content={"error": "review_conflict",
+                     "detail": "X-Review-ID was sealed concurrently with "
+                               "different review content",
+                     "review_id": review_id,
+                     "existing_request_id": data.get("request_id")})
+    return JSONResponse(status_code=201 if outcome == "ok" else 200,
+                        content=data)
+
+
+@app.get("/inventory/plans/{request_id}/reviews/{review_id}")
+async def read_execution_review(request_id: str, review_id: str):
+    report = await get_execution_review(app.state.db, review_id)
+    if report is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no sealed review with id {review_id}"},
+        )
+    if report.get("request_id") != request_id:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"review {review_id} is not sealed for "
+                               f"request {request_id}",
+                     "request_id": report.get("request_id")},
+        )
+    return report
+
+
+@app.get("/reviews/{review_id}")
+async def read_execution_review_any(review_id: str):
+    report = await get_execution_review(app.state.db, review_id)
+    if report is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"no sealed review with id {review_id}"},
+        )
+    return report

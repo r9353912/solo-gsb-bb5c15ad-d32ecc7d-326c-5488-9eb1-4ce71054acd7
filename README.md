@@ -15,6 +15,10 @@
   未选择逐步模式（默认）的计划继续沿用现有创建、整单确认/取消、同号重试与召回约定。
   发现批次污染时可凭批次号 + 原因发起**不可撤销召回**（`POST /batches/{id}/recall`），
   冻结受影响计划与目标孔清单，并阻断召回后的新预留与待处理预留的确认。
+  已完成或已中止的逐步计划可凭计划编号 + 全量有序实际转移记录 + 唯一复核编号
+  发起**执行差异复核**（`POST /inventory/plans/{id}/reviews`）：逐步比对冻结
+  计划，输出每步匹配结果、首个缺失/多余/不一致位置与冻结/实际库存转出汇总，
+  封存不可变复核报告；复核只读，不改库存、计划或已登记步骤。
 
 - 体积一律使用**整数纳升（nL）**；
 - 浓度一律使用**有理数**（`fractions.Fraction`，输入如 `"2/3"`、`"0.25"`、`"40"`）；
@@ -43,7 +47,7 @@ docker compose up --build
 2. 在应用镜像内 `pip install -r requirements.txt`；
 3. 应用启动时自动连接数据库并执行 `CREATE TABLE IF NOT EXISTS ...` 建表
    （`plans`、`batches`、`reservations`、`reservation_items`、
-   `step_registrations`、`recalls`；
+   `step_registrations`、`recalls`、`execution_reviews`；
    对既有库用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐批次召回列与
    逐步执行列、幂等放宽 `reservations.status` 约束，无需手工迁移）。
 
@@ -327,6 +331,100 @@ docker compose up --build
 `GET /batches` 与 `GET /batches/{id}` 的批次对象另附实时召回字段
 `recalled` / `recalled_reason` / `recalled_at`。
 
+### 执行差异复核（已完成 / 已中止的逐步计划）
+
+对**已经结束的库存逐步计划**（`completed` / `aborted`），可提交一份
+**全量有序的实际转移记录**（每步的步骤号、来源、目的、体积）与创建时
+冻结的计划逐步比对，封存一份**不可变的执行差异复核报告**。复核**只读**：
+绝不改动库存、计划或已登记步骤。
+
+#### `POST /inventory/plans/{request_id}/reviews`
+
+请求头：
+
+- `X-Review-ID`（**必填**）：唯一复核编号，用于复核的重试幂等与冲突检测
+  （1–64 字符，不得以 `@` 开头）。
+
+请求体：
+
+```json
+{
+  "actual_transfers": [
+    {"step": 1, "source": {"kind": "stock", "id": "S1"},
+     "destination": {"kind": "intermediate", "id": "I1", "container": "tube-2"},
+     "volume_nl": 600},
+    {"step": 2, "source": {"kind": "diluent"},
+     "destination": {"kind": "intermediate", "id": "I1", "container": "tube-2"},
+     "volume_nl": 400}
+  ]
+}
+```
+
+实际记录必须**按步骤号严格升序、步骤号不可重复**（允许缺号：缺号在报告中
+体现为冻结有、实际无的 *missing*）；`actual_transfers` 可为空（中止于任何
+步骤登记之前）。来源/目的节点结构同逐步登记（`kind` ∈ `stock`/`diluent`/
+`intermediate`/`well`；stock/well 需 `id`，intermediate 需 `container`），
+体积为正整数。
+
+**响应：**
+
+- `201 Created`：首次封存报告。报告字段：
+  - `review_id` / `request_id` / `sealed_at` / `content_hash`；
+  - `execution_status`（`completed` / `aborted`）、`execution_mode`；
+  - `frozen_step_count` / `actual_step_count` / `all_match`；
+  - `steps[]`：冻结与实际步骤号并集、按步骤号升序的逐步比对结果，每步
+    `status` 为：
+    - `matched`：步骤号与来源/目的/体积**完全一致**；
+    - `missing`：冻结计划有该步、实际记录没有（如中止后未执行的步骤），
+      条目只含 `frozen`；
+    - `extra`：实际记录有该步、冻结计划没有，条目只含 `actual`；
+    - `content_mismatch`：步骤号相同但来源/目的/体积不一致，附
+      `differences`（`source` / `destination` / `volume_nl` 的子集）及
+      `frozen` / `actual`；
+  - `summary`：各状态计数（`total` / `matched` / `missing` / `extra` /
+    `content_mismatch`），另有 `missing_steps[]` / `extra_steps[]` /
+    `mismatch_steps[]` 三个便捷列表；
+  - `first_discrepancy`：首个（按步骤号）非匹配条目；完全一致时为 `null`；
+  - `stock_out_summary`：冻结与实际的**库存转出汇总**——
+    `frozen_total_nl` / `actual_total_nl` / `delta_nl`（实际−冻结）与
+    `batches[]`（每个**实际或冻结涉及的批次**一行：`batch_id`、
+    `frozen_nl`、`actual_nl`、`delta_nl`、`frozen_steps[]`、
+    `actual_steps[]`；实际多转出的未知批次以 `frozen_nl:0` 列入）。
+    只统计来源为 `stock` 的转移（与预留/记账口径一致）。
+- `200 OK`：**同一 `X-Review-ID` + 同内容**重试，原样返回首次封存的报告
+  （报告永不改变；即使计划之后状态再变化，同内容重放仍返回原报告）；
+- `409 Conflict`：
+  - `review_conflict`：同一复核编号已封存**不同内容**（附
+    `existing_request_id`）；
+  - `plan_not_finished`：计划不存在冻结行、冻结但非可行、是普通模式计划、
+    无库存预留、或逐步计划尚未结束（仍为 `stepwise`，附当前 `status`）；
+  - `whole_execution_mode`：该计划是整单模式（无逐步执行记录可复核）；
+- `404 Not Found`：`unknown_plan`（该请求号没有冻结计划，**不留报告**）；
+- `400 Bad Request`：整批非法，**拒绝且不封存任何报告**：
+  - `duplicate_step`：实际记录中步骤号重复（附 `step`）；
+  - `steps_not_ordered`：步骤号未严格升序（附 `step` / `previous_step`）；
+  - `illegal_node`：结构非法的节点——well 作为来源、stock/diluent 作为
+    目的、stock 节点无 `id`、intermediate 节点无 `container`
+    （附 `step` / `role` / `node`）；
+  - pydantic 校验错误（节点 `kind` 非法、步骤号/体积非正等）返回
+    `invalid_request`；
+  - 缺少/空白 `X-Review-ID` 头：`422` / `invalid_request`。
+- 语义差异（来源批次是未登记的未知批次、目的不同、体积不同等）**不是 400**：
+  请求被接受，差异体现在封存报告的 `content_mismatch` / `extra` 与
+  库存转出汇总中。
+
+#### `GET /inventory/plans/{request_id}/reviews/{review_id}` / `GET /reviews/{review_id}`
+
+取回封存的不可变复核报告（与首次 `201` / 重放 `200` 完全一致）：
+
+- `200 OK`：报告存在（前者还要求该复核确属该请求号，否则 `404` 并附
+  报告真实的 `request_id`）；
+- `404 Not Found`：复核编号不存在（`not_found`）。
+
+复核记录存于启动时自动创建的 `execution_reviews` 表
+（`review_id` 主键、`content_hash`、`report` JSONB、`sealed_at`），
+**只插入、永不更新、永不删除**。
+
 ---
 
 ## 4. 调用示例
@@ -375,6 +473,16 @@ bash examples/stepwise.sh
 python3 examples/stepwise_demo.py
 ```
 
+执行差异复核完整流程（结案/中止后的逐步计划 → 全量有序实际记录逐步比对：
+matched/missing/content_mismatch 与首个差异位置、冻结与实际的批次转出汇总 →
+同复核编号同内容回放、异内容冲突 → 未知/未结束计划、重复步骤、非法节点、非正体积
+整批拒绝且不留报告 → 复核只读不改库存/计划/登记）：
+
+```bash
+bash examples/review.sh
+python3 examples/review_demo.py
+```
+
 示例（1000 浓度母液，移液器 500–1000nL、步进 100nL，目标 A1=400、A2=100）会生成
 两个中间液（如 400 与 100），并把较大的批量安排进较大的容器，所有转移均为 500–1000nL。
 
@@ -403,13 +511,14 @@ python3 -m pytest tests/     # 完整测试（含库存模式与并发用例）
 ```
 app/
   main.py          FastAPI 路由与状态码（/plans、/batches、/inventory/plans、
-                   确认/取消、逐步登记/结案/中止、批次召回）
-  models.py        Pydantic 请求/响应模型与浓度校验（含逐步登记请求）
+                   确认/取消、逐步登记/结案/中止、批次召回、执行差异复核）
+  models.py        Pydantic 请求/响应模型与浓度校验（含逐步登记与复核请求）
   planning.py      请求 -> 求解器映射、引用校验、幂等哈希、批次用量统计、
                    逐步进度与已用/待取统计、召回影响孔追踪（沿转移穿过中间液、
-                   逐步计划按已执行步骤前缀追踪）
+                   逐步计划按已执行步骤前缀追踪）、执行差异逐步比对与复核哈希
   db.py            asyncpg 连接池、建表、冻结/取回、批次登记、原子预留、
-                   确认/取消、逐步登记/结案/中止、不可撤销召回（单事务 + 行锁裁决）
+                   确认/取消、逐步登记/结案/中止、不可撤销召回、
+                   不可变执行复核封存/取回（单事务 + 行锁裁决）
   solver/
     core.py        数据结构、移液器可行性、最小批量
     options.py     候选方案（直接/双源/新中间液/逐级稀释链）
@@ -417,11 +526,13 @@ app/
     solve.py       solve() 入口、计划组装、独立校验、无解诊断
 examples/          request.json、inventory.json、inventory_stepwise.json、
                    curl.sh、inventory.sh、call_api.py、inventory_demo.py、
-                   recall.sh、recall_demo.py、stepwise.sh、stepwise_demo.py
+                   recall.sh、recall_demo.py、stepwise.sh、stepwise_demo.py、
+                   review.sh、review_demo.py
 tests/             smoke.py（求解器）、api_smoke.py（HTTP+幂等）、
                    test_api.py、test_solver.py、test_inventory.py（库存/并发）、
                    test_recall.py（召回/追踪/并发裁决）、
-                   test_stepwise.py（逐步登记/结案/中止/召回并发）
+                   test_stepwise.py（逐步登记/结案/中止/召回并发）、
+                   test_reviews.py（执行差异复核/幂等/冲突/只读）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -517,3 +628,41 @@ Dockerfile, docker-compose.yml, requirements.txt
    `examples/stepwise_demo.py`（仅标准库）；新增 `tests/test_stepwise.py`
    （登记/重试/跳步/结案/中止、查询进度、召回阻断与已执行路径报告、
    召回/登记并发与同步骤并发幂等）；既有 68 个测试全部保持通过。
+
+---
+
+## 10. 本轮变动（执行差异复核）
+
+1. **新增执行差异复核**：`POST /inventory/plans/{id}/reviews`
+   （计划编号在路径、唯一复核编号在 `X-Review-ID` 头、全量有序实际转移记录
+   在体）与 `GET /inventory/plans/{id}/reviews/{review_id}` /
+   `GET /reviews/{review_id}`。仅接受**已完成（completed）或已中止
+   （aborted）的库存逐步计划**；未知计划 `404 unknown_plan`，普通模式、
+   非可行冻结、无预留或尚未结束的计划 `409`（`whole_execution_mode` /
+   `plan_not_finished`），一律不留报告。
+2. **逐步比对与汇总**：按冻结步骤与实际步骤号的并集逐步输出 `matched` /
+   `missing`（冻结有、实际无）/ `extra`（实际有、冻结无）/
+   `content_mismatch`（来源/目的/体积不一致，附 `differences`），给出
+   首个差异位置 `first_discrepancy`、各状态计数与三个步骤号便捷列表，以及
+   **冻结 vs 实际的库存转出汇总**（总量、差额、每批次冻结/实际 nL 与涉及
+   步骤；只计 stock 来源，实际多出的未知批次也单列）。
+3. **不可变封存与幂等**：新增 `execution_reviews` 表（启动时
+   `CREATE TABLE IF NOT EXISTS`，无需手工迁移），报告**只插入、永不更新、
+   永不删除**；同一 `X-Review-ID` 同内容重试原样返回原报告（`200`），
+   异内容 `409 review_conflict`；并发同号首封者胜（`ON CONFLICT DO NOTHING`
+   + 封后复读裁决）。复核在任何资格检查之前先查已封存记录：已封存报告的
+   同内容重放不再依赖计划当前状态。
+4. **整批拒绝不留痕**：步骤号重复（`duplicate_step`）、未严格升序
+   （`steps_not_ordered`；允许缺号，缺号在报告中体现为 missing）、结构非法
+   节点（`illegal_node`：well 作来源、stock/diluent 作目的、stock 无 id、
+   intermediate 无 container）、节点 kind 非法或体积非正（pydantic 400）
+   一律整批拒绝且**不封存报告**；语义差异（未知批次、来源/目的/体积与冻结
+   不符）不是非法输入，会被接受并写入报告。
+5. **只读与兼容性**：复核只读取冻结计划与预留状态、向 `execution_reviews`
+   插入一行，**不修改库存、计划或已登记步骤**；既有全部接口、幂等与状态码
+   语义不变，`docker compose up` 启动方式与健康检查保持可用；版本号升至
+   `1.4.0`。
+6. **用法与测试**：新增 `examples/review.sh`、`examples/review_demo.py`
+   （仅标准库）；新增 `tests/test_reviews.py`（完美匹配/中止缺失/体积与来源
+   不一致/多余步骤、同号回放与异内容冲突、四类整批拒绝不留报告、资格校验、
+   复核只读、两种 GET 取回路径），比对核心为 `planning.py` 中的纯函数。

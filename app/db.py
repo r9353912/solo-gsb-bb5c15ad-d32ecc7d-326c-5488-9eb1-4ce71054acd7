@@ -100,6 +100,19 @@ CREATE TABLE IF NOT EXISTS recalls (
     report          JSONB NOT NULL,
     recalled_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Immutable post-execution reconciliation reviews. A row is inserted once
+-- and never updated or deleted: the sealed report is returned verbatim on
+-- every later GET / same-content retry; same review id + different content
+-- is rejected as a conflict. Reviews only read plans/reservations; they
+-- never modify inventory, plans or step registrations.
+CREATE TABLE IF NOT EXISTS execution_reviews (
+    review_id       TEXT PRIMARY KEY,
+    request_id      TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    report          JSONB NOT NULL,
+    sealed_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -1004,3 +1017,72 @@ async def get_recall(pool, batch_id: str):
             "recalled_at": row["recalled_at"].isoformat(),
             "report": json.loads(row["report"]),
         }
+
+
+# --------------------------------------------------------------------------- #
+# Execution-variance reconciliation reviews (immutable)
+# --------------------------------------------------------------------------- #
+
+
+async def seal_execution_review(pool, review_id: str, request_id: str,
+                                content_hash: str, report: dict):
+    """Seal an immutable reconciliation report under ``review_id``.
+
+    The full document (report augmented with its ids and sealing timestamp)
+    is inserted once and never changed. Returns ``(outcome, data)``:
+
+    * ``("ok", data)``     - the review was sealed by this call (201);
+    * ``("replay", data)`` - ``review_id`` already stored the same content;
+                             the original sealed document is returned (200);
+    * ``("conflict", data)`` - ``review_id`` is already sealed with different
+                             content; the original content hash is returned so
+                             the caller can answer 409 without exposing the
+                             other submission's report.
+
+    Reviews write no other table: plans, reservations, step registrations
+    and batch balances are untouched.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                INSERT INTO execution_reviews
+                    (review_id, request_id, content_hash, report)
+                VALUES ($1, $2, $3, $4::jsonb)
+                ON CONFLICT (review_id) DO NOTHING
+                RETURNING sealed_at
+                """,
+                review_id, request_id, content_hash, json.dumps(report),
+            )
+            if row is not None:
+                data = dict(report)
+                data["review_id"] = review_id
+                data["request_id"] = request_id
+                data["sealed_at"] = row["sealed_at"].isoformat()
+                # Persist the complete sealed document (ids + timestamp
+                # included) so every replay is byte-for-byte identical.
+                await conn.execute(
+                    "UPDATE execution_reviews SET report = $2::jsonb "
+                    "WHERE review_id = $1",
+                    review_id, json.dumps(data),
+                )
+                return "ok", data
+            existing = await conn.fetchrow(
+                "SELECT request_id, content_hash, report "
+                "FROM execution_reviews WHERE review_id = $1",
+                review_id,
+            )
+            if existing["content_hash"] == content_hash:
+                return "replay", json.loads(existing["report"])
+            return "conflict", {"review_id": review_id,
+                                "request_id": existing["request_id"]}
+
+
+async def get_execution_review(pool, review_id: str):
+    """Return the sealed review document, or ``None`` if no such review."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT report FROM execution_reviews WHERE review_id = $1",
+            review_id,
+        )
+    return json.loads(row["report"]) if row is not None else None

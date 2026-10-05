@@ -301,3 +301,218 @@ def traced_wells_for_executed_steps(plan: dict, batch_id: str,
     """Wells reached from ``batch_id`` through the executed step prefix only."""
     return traced_wells_for_batch(
         executed_prefix_plan(plan, registered_steps), batch_id)
+
+
+# --------------------------------------------------------------------------- #
+# Post-execution reconciliation reviews
+# --------------------------------------------------------------------------- #
+
+
+def _node_view(node: dict) -> dict:
+    """Canonical node shape (kind/id/container, missing keys -> ``None``)."""
+    return {"kind": node.get("kind"),
+            "id": node.get("id"),
+            "container": node.get("container")}
+
+
+def _transfer_view(t: dict) -> dict:
+    """Canonical transfer shape as frozen/compared in a review."""
+    return {"step": t["step"],
+            "source": _node_view(t["source"]),
+            "destination": _node_view(t["destination"]),
+            "volume_nl": t["volume_nl"]}
+
+
+def nodes_equal(left: dict, right: dict) -> bool:
+    """Exact node equality on kind/id/container."""
+    return _node_view(left) == _node_view(right)
+
+
+def validate_actual_transfers(transfers: list[dict]):
+    """Structural validation of a submitted actual-transfer record list.
+
+    These conditions reject the *whole* review request (400) without sealing
+    any report:
+
+    * a step number occurs more than once (``duplicate_step``);
+    * the records are not strictly ascending by step number
+      (``steps_not_ordered`` -- the contract requires the full ordered
+      record; gaps are allowed and show up as *missing* steps in the report);
+    * a node is structurally illegal (``illegal_node``): a well used as a
+      source, a stock/diluent used as a destination, a stock node without an
+      id, or an intermediate node without a container.
+
+    Semantic differences against the frozen plan (unknown batches, other
+    sources/destinations, other volumes) are *not* illegal -- they are the
+    discrepancies the review exists to report. Returns ``None`` when valid,
+    otherwise an error descriptor.
+    """
+    seen: set[int] = set()
+    previous = 0
+    for t in transfers:
+        n = t["step"]
+        if n in seen:
+            return {"error": "duplicate_step",
+                    "detail": f"step {n} appears more than once in the "
+                              "actual transfer record",
+                    "step": n}
+        if n <= previous:
+            return {"error": "steps_not_ordered",
+                    "detail": "actual transfers must be strictly ordered by "
+                              f"step number; step {n} follows step {previous}",
+                    "step": n, "previous_step": previous}
+        seen.add(n)
+        previous = n
+        for role in ("source", "destination"):
+            node = _node_view(t[role])
+            kind = node["kind"]
+            illegal = None
+            if role == "source":
+                if kind == "well":
+                    illegal = "a well can only be a transfer destination"
+                elif kind == "stock" and not node["id"]:
+                    illegal = "a stock source node requires an id"
+                elif kind == "intermediate" and not node["container"]:
+                    illegal = "an intermediate source node requires a container"
+            else:
+                if kind in ("stock", "diluent"):
+                    illegal = f"a {kind} node can only be a transfer source"
+                elif kind == "well" and not node["id"]:
+                    illegal = "a well destination node requires an id"
+                elif kind == "intermediate" and not node["container"]:
+                    illegal = ("an intermediate destination node requires "
+                               "a container")
+            if illegal is not None:
+                return {"error": "illegal_node",
+                        "detail": f"illegal {role} node on step {n}: {illegal}",
+                        "step": n, "role": role, "node": node}
+    return None
+
+
+def _stock_totals(transfers: list[dict]):
+    """Per-batch stock-out totals and the step numbers that produce them."""
+    totals: dict[str, int] = {}
+    steps: dict[str, list[int]] = {}
+    for t in sorted(transfers, key=lambda x: x["step"]):
+        src = t["source"]
+        if src["kind"] != "stock":
+            continue
+        bid = src["id"]
+        totals[bid] = totals.get(bid, 0) + t["volume_nl"]
+        steps.setdefault(bid, []).append(t["step"])
+    return totals, steps
+
+
+def build_execution_review(plan: dict, actual_transfers: list[dict],
+                           plan_status: str) -> dict:
+    """Compare the frozen plan step by step with the actual transfer record.
+
+    Produces an immutable review body:
+
+    * ``steps[]`` -- one entry per step number in the union of frozen and
+      actual step numbers, each marked ``matched`` / ``missing`` (frozen but
+      not executed) / ``extra`` (executed but not frozen) /
+      ``content_mismatch`` (same step number, different source/destination/
+      volume), with the frozen and/or actual transfer attached;
+    * ``first_discrepancy`` -- the first entry (ascending step number) that is
+      not a match, or ``null`` when everything matches;
+    * ``stock_out_summary`` -- frozen vs actual nanoliters actually drawn from
+      each stock batch, per-batch step lists and actual-minus-frozen deltas.
+
+    The function is pure: it never mutates the plan, the steps or any
+    inventory state.
+    """
+    frozen = {t["step"]: _transfer_view(t)
+              for t in plan.get("transfers", [])}
+    actual = {t["step"]: _transfer_view(t) for t in actual_transfers}
+
+    entries = []
+    counts = {"matched": 0, "missing": 0, "extra": 0,
+              "content_mismatch": 0}
+    first_discrepancy = None
+    for n in sorted(frozen.keys() | actual.keys()):
+        f = frozen.get(n)
+        a = actual.get(n)
+        entry: dict = {"step": n}
+        if f is not None and a is None:
+            kind = "missing"
+        elif a is not None and f is None:
+            kind = "extra"
+        elif not transfers_match(f, a["source"], a["destination"],
+                                 a["volume_nl"]):
+            kind = "content_mismatch"
+            diffs = []
+            if not nodes_equal(f["source"], a["source"]):
+                diffs.append("source")
+            if not nodes_equal(f["destination"], a["destination"]):
+                diffs.append("destination")
+            if f["volume_nl"] != a["volume_nl"]:
+                diffs.append("volume_nl")
+            entry["differences"] = diffs
+        else:
+            kind = "matched"
+        entry["status"] = kind
+        if f is not None:
+            entry["frozen"] = f
+        if a is not None:
+            entry["actual"] = a
+        counts[kind] += 1
+        entries.append(entry)
+        if kind != "matched" and first_discrepancy is None:
+            first_discrepancy = dict(entry)
+
+    frozen_totals, frozen_steps = _stock_totals(list(frozen.values()))
+    actual_totals, actual_steps = _stock_totals(list(actual.values()))
+    batches = []
+    for bid in sorted(frozen_totals.keys() | actual_totals.keys()):
+        f_nl = frozen_totals.get(bid, 0)
+        a_nl = actual_totals.get(bid, 0)
+        batches.append({
+            "batch_id": bid,
+            "frozen_nl": f_nl,
+            "actual_nl": a_nl,
+            "delta_nl": a_nl - f_nl,
+            "frozen_steps": frozen_steps.get(bid, []),
+            "actual_steps": actual_steps.get(bid, []),
+        })
+    frozen_total = sum(frozen_totals.values())
+    actual_total = sum(actual_totals.values())
+
+    return {
+        "execution_status": plan_status,
+        "execution_mode": "stepwise",
+        "frozen_step_count": len(frozen),
+        "actual_step_count": len(actual),
+        "all_match": (counts["matched"] == len(frozen) == len(actual)),
+        "summary": {
+            "total": len(entries),
+            **counts,
+        },
+        "missing_steps": [e["step"] for e in entries
+                          if e["status"] == "missing"],
+        "extra_steps": [e["step"] for e in entries
+                        if e["status"] == "extra"],
+        "mismatch_steps": [e["step"] for e in entries
+                           if e["status"] == "content_mismatch"],
+        "first_discrepancy": first_discrepancy,
+        "steps": entries,
+        "stock_out_summary": {
+            "frozen_total_nl": frozen_total,
+            "actual_total_nl": actual_total,
+            "delta_nl": actual_total - frozen_total,
+            "batches": batches,
+        },
+    }
+
+
+def review_content_hash(request_id: str, transfers: list[dict]) -> str:
+    """Stable hash of a review submission (plan id + ordered actual record).
+
+    Same review id + same content replays the original sealed report; same
+    review id with different content is a conflict.
+    """
+    payload = {"request_id": request_id,
+               "transfers": [_transfer_view(t) for t in transfers]}
+    blob = json.dumps(payload, sort_keys=True,
+                      separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
