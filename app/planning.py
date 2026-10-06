@@ -301,3 +301,133 @@ def traced_wells_for_executed_steps(plan: dict, batch_id: str,
     """Wells reached from ``batch_id`` through the executed step prefix only."""
     return traced_wells_for_batch(
         executed_prefix_plan(plan, registered_steps), batch_id)
+
+
+# --------------------------------------------------------------------------- #
+# Execution-variance review
+# --------------------------------------------------------------------------- #
+
+
+def _canonical_node(node: dict) -> dict:
+    return {"kind": node.get("kind"), "id": node.get("id"),
+            "container": node.get("container")}
+
+
+def review_hash(request_id: str, actual_transfers: list[dict]) -> str:
+    """Stable content hash for review idempotency / conflict detection.
+
+    Records are normalized -- sorted by step number, nodes reduced to
+    kind/id/container -- so a retry carrying the same records in a different
+    submission order still hashes identically, while any content change
+    (different plan, step, node or volume) hashes differently.
+    """
+    norm = [
+        {"step": t["step"],
+         "source": _canonical_node(t["source"]),
+         "destination": _canonical_node(t["destination"]),
+         "volume_nl": t["volume_nl"]}
+        for t in sorted(actual_transfers, key=lambda x: x["step"])
+    ]
+    data = {"request_id": request_id, "actual_transfers": norm}
+    blob = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _nodes_differ(frozen_node: dict, actual_node: dict) -> bool:
+    return any(frozen_node.get(k) != actual_node.get(k)
+               for k in ("kind", "id", "container"))
+
+
+def compare_actual_transfers(plan: dict, actual_transfers: list[dict]) -> dict:
+    """Step-by-step comparison of the actual record against the frozen plan.
+
+    ``actual_transfers`` is the submitter's full ordered record
+    (``{step, source, destination, volume_nl}`` dicts with unique step
+    numbers -- duplicates are rejected by the caller). The comparison is
+    anchored on the frozen plan: every frozen step is
+
+    * ``matched``           - an actual record with the same step number
+                              reproduces source/destination/volume verbatim;
+    * ``content_mismatch``  - same step number but different content (the
+                              differing fields are named in ``differences``);
+    * ``missing``           - no actual record carries this step number.
+
+    Actual records whose step number no frozen step owns are ``extra``.
+    The result also carries the first position of each anomaly class and the
+    frozen-vs-actual stock-out summary per batch (frozen = volume the plan
+    draws from each batch; actual = volume the submitted record draws).
+    Pure function: the review never mutates inventory, plans or registered
+    steps.
+    """
+    frozen_steps = plan.get("transfers", [])
+    actual_by_step = {t["step"]: t for t in actual_transfers}
+    frozen_numbers = {f["step"] for f in frozen_steps}
+
+    steps_out = []
+    matched = missing = mismatched = 0
+    first_missing = first_mismatch = None
+    for f in frozen_steps:
+        n = f["step"]
+        a = actual_by_step.get(n)
+        if a is None:
+            missing += 1
+            if first_missing is None:
+                first_missing = n
+            steps_out.append({"step": n, "status": "missing",
+                              "frozen": f, "actual": None})
+            continue
+        diffs = []
+        if _nodes_differ(f["source"], a["source"]):
+            diffs.append("source")
+        if _nodes_differ(f["destination"], a["destination"]):
+            diffs.append("destination")
+        if f["volume_nl"] != a["volume_nl"]:
+            diffs.append("volume_nl")
+        if diffs:
+            mismatched += 1
+            if first_mismatch is None:
+                first_mismatch = n
+            steps_out.append({"step": n, "status": "content_mismatch",
+                              "frozen": f, "actual": a,
+                              "differences": diffs})
+        else:
+            matched += 1
+            steps_out.append({"step": n, "status": "matched",
+                              "frozen": f, "actual": a})
+
+    extras = sorted((t for s, t in actual_by_step.items()
+                     if s not in frozen_numbers),
+                    key=lambda t: t["step"])
+
+    frozen_usage = stock_usage_from_plan(plan)
+    actual_usage: dict[str, int] = {}
+    for t in actual_transfers:
+        src = t["source"]
+        if src.get("kind") == "stock" and src.get("id"):
+            actual_usage[src["id"]] = (actual_usage.get(src["id"], 0)
+                                       + t["volume_nl"])
+    stock_summary = [
+        {"batch_id": b,
+         "frozen_nl": frozen_usage.get(b, 0),
+         "actual_nl": actual_usage.get(b, 0),
+         "difference_nl": actual_usage.get(b, 0) - frozen_usage.get(b, 0)}
+        for b in sorted(set(frozen_usage) | set(actual_usage))
+    ]
+
+    return {
+        "matched": not (missing or mismatched or extras),
+        "summary": {
+            "total_steps": len(frozen_steps),
+            "actual_records": len(actual_transfers),
+            "matched_steps": matched,
+            "missing_steps": missing,
+            "mismatched_steps": mismatched,
+            "extra_records": len(extras),
+        },
+        "steps": steps_out,
+        "extra_records": extras,
+        "first_missing_step": first_missing,
+        "first_mismatch_step": first_mismatch,
+        "first_extra_step": extras[0]["step"] if extras else None,
+        "stock_summary": stock_summary,
+    }

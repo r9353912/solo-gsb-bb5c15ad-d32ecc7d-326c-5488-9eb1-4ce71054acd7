@@ -61,6 +61,8 @@ def store(monkeypatch):
         ("abort_stepwise", st.abort_stepwise),
         ("recall_batch", st.recall_batch),
         ("get_recall", st.get_recall),
+        ("create_review", st.create_review),
+        ("get_review", st.get_review),
     ]
     for name, fn in pairs:
         monkeypatch.setattr(db, name, fn)

@@ -227,6 +227,31 @@ class StepRegistrationIn(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Execution-variance review
+# --------------------------------------------------------------------------- #
+
+
+class ActualTransferIn(BaseModel):
+    """One physically executed transfer submitted for variance review."""
+    step: int = Field(ge=1)
+    source: NodeIn
+    destination: NodeIn
+    volume_nl: int = Field(gt=0)
+
+
+class ReviewIn(BaseModel):
+    """Execution-variance review request: the full ordered actual record.
+
+    ``actual_transfers`` is the submitter's complete, ordered record of what
+    was physically transferred (step number, source, destination, volume);
+    it is compared step by step against the frozen plan. An empty list
+    states that nothing was transferred at all. Step numbers must be
+    unique -- duplicates reject the whole submission.
+    """
+    actual_transfers: list[ActualTransferIn]
+
+
+# --------------------------------------------------------------------------- #
 # Response pieces
 # --------------------------------------------------------------------------- #
 

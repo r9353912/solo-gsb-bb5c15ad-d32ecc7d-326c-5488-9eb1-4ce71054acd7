@@ -15,6 +15,9 @@
   未选择逐步模式（默认）的计划继续沿用现有创建、整单确认/取消、同号重试与召回约定。
   发现批次污染时可凭批次号 + 原因发起**不可撤销召回**（`POST /batches/{id}/recall`），
   冻结受影响计划与目标孔清单，并阻断召回后的新预留与待处理预留的确认。
+  已结束（已确认/已结案/已中止）的库存计划可提交**执行差异复核**
+  （`POST /inventory/plans/{id}/review`）：凭唯一复核编号上传全量有序实际转移记录，
+  系统按冻结计划逐步比对并封存不可变复核报告；报告不改库存、计划或已登记步骤。
 
 - 体积一律使用**整数纳升（nL）**；
 - 浓度一律使用**有理数**（`fractions.Fraction`，输入如 `"2/3"`、`"0.25"`、`"40"`）；
@@ -43,7 +46,7 @@ docker compose up --build
 2. 在应用镜像内 `pip install -r requirements.txt`；
 3. 应用启动时自动连接数据库并执行 `CREATE TABLE IF NOT EXISTS ...` 建表
    （`plans`、`batches`、`reservations`、`reservation_items`、
-   `step_registrations`、`recalls`；
+   `step_registrations`、`recalls`、`reviews`；
    对既有库用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐批次召回列与
    逐步执行列、幂等放宽 `reservations.status` 约束，无需手工迁移）。
 
@@ -327,6 +330,72 @@ docker compose up --build
 `GET /batches` 与 `GET /batches/{id}` 的批次对象另附实时召回字段
 `recalled` / `recalled_reason` / `recalled_at`。
 
+### `POST /inventory/plans/{request_id}/review`
+
+对**已结束**的库存计划做执行差异复核：提交全量有序实际转移记录，系统按冻结计划
+逐步比对并**封存不可变复核报告**。复核是纯记录行为——**不改库存、计划或已登记步骤**。
+
+请求头：
+
+- `X-Review-ID`（**必填**）：唯一复核编号，用于重试幂等与冲突检测。
+
+请求体：
+
+```json
+{
+  "actual_transfers": [
+    {
+      "step": 1,
+      "source": {"kind": "stock", "id": "S1"},
+      "destination": {"kind": "intermediate", "id": "I1", "container": "tube-2"},
+      "volume_nl": 600
+    }
+  ]
+}
+```
+
+`actual_transfers` 为提交方的全量有序实际转移记录（步骤号、来源、目的、体积；
+空列表表示"没有任何实际转移"）。可复核的计划状态：整单模式 `confirmed`、
+逐步模式 `completed` / `aborted`；`reserved` / `stepwise`（未结束）与
+`cancelled`（从未执行）不可复核。
+
+**响应：**
+
+- `201 Created`：首次复核，报告封存。体含 `review_id`、`request_id`、`reviewed_at`
+  与 `report`：
+  - `report.matched`：实际记录是否与冻结计划完全一致；
+  - `report.summary`：`total_steps` / `actual_records` / `matched_steps` /
+    `missing_steps` / `mismatched_steps` / `extra_records` 计数；
+  - `report.steps[]`：**每步匹配结果**——`matched`（同号记录逐字段一致）、
+    `missing`（无此步骤号的实际记录）、`content_mismatch`（同号但内容不一致，
+    附 `differences`，列出不一致字段 `source` / `destination` / `volume_nl`），
+    每步附 `frozen`（冻结内容）与 `actual`（实际记录）；
+  - `report.extra_records[]`：冻结计划之外的多余实际记录；
+  - `report.first_missing_step` / `first_mismatch_step` / `first_extra_step`：
+    首个缺失 / 内容不一致 / 多余的位置（无则 `null`）；
+  - `report.stock_summary[]`：**冻结与实际的库存转出汇总**（按批次
+    `frozen_nl` / `actual_nl` / `difference_nl`；实际记录引用了计划外批次时
+    该批次 `frozen_nl` 为 0）；
+  - `report.execution_mode` / `reservation_status`：复核时刻的终态快照。
+- `200 OK`：同一复核编号 + 相同内容重试，返回原封存报告（记录顺序不影响内容判定）。
+- `409 Conflict`：同一复核编号但内容不同（`error: "idempotency_conflict"`，
+  含换计划提交），原报告不变。
+- `409 plan_not_ended`：计划未结束（`reserved` / `stepwise`）或已取消（`cancelled`）。
+- `404 Not Found`：未知计划（含非库存计划、无解冻结的计划——它们没有可复核的执行）。
+- `400 Bad Request`：缺/空 `X-Review-ID`、重复步骤号（`error: "duplicate_step"`，
+  附 `steps`）、非法节点 kind、非正体积、非法步骤号。
+
+**所有拒绝（400/404/409）均整批生效且不留任何报告**，复核编号不被占用，
+修正后可用同一编号重新提交。同一计划可用不同复核编号复核多次；并发同号提交
+恰好一个封存（`201`），同内容其余回放（`200`），异内容其余冲突（`409`）。
+
+### `GET /reviews/{review_id}`
+
+取回封存的复核报告（与首次复核返回完全一致）：
+
+- `200 OK`：已封存的复核；
+- `404 Not Found`：该复核编号不存在（`error: "not_found"`）。
+
 ---
 
 ## 4. 调用示例
@@ -375,6 +444,15 @@ bash examples/stepwise.sh
 python3 examples/stepwise_demo.py
 ```
 
+执行差异复核完整流程（逐步计划执行至结案 → 按冻结计划逐步比对实际转移记录并封存
+不可变报告 → 同号同内容回放 / 异内容冲突 → 中止计划的缺失步骤与库存转出差异 →
+未知/未结束计划、重复步骤等整批拒绝且不留报告 → GET 取回封存报告）：
+
+```bash
+bash examples/review.sh
+python3 examples/review_demo.py
+```
+
 示例（1000 浓度母液，移液器 500–1000nL、步进 100nL，目标 A1=400、A2=100）会生成
 两个中间液（如 400 与 100），并把较大的批量安排进较大的容器，所有转移均为 500–1000nL。
 
@@ -403,13 +481,14 @@ python3 -m pytest tests/     # 完整测试（含库存模式与并发用例）
 ```
 app/
   main.py          FastAPI 路由与状态码（/plans、/batches、/inventory/plans、
-                   确认/取消、逐步登记/结案/中止、批次召回）
-  models.py        Pydantic 请求/响应模型与浓度校验（含逐步登记请求）
+                   确认/取消、逐步登记/结案/中止、批次召回、执行差异复核）
+  models.py        Pydantic 请求/响应模型与浓度校验（含逐步登记与复核请求）
   planning.py      请求 -> 求解器映射、引用校验、幂等哈希、批次用量统计、
                    逐步进度与已用/待取统计、召回影响孔追踪（沿转移穿过中间液、
-                   逐步计划按已执行步骤前缀追踪）
+                   逐步计划按已执行步骤前缀追踪）、复核逐步比对与库存转出汇总
   db.py            asyncpg 连接池、建表、冻结/取回、批次登记、原子预留、
-                   确认/取消、逐步登记/结案/中止、不可撤销召回（单事务 + 行锁裁决）
+                   确认/取消、逐步登记/结案/中止、不可撤销召回（单事务 + 行锁裁决）、
+                   复核报告封存/取回（首写胜出、同号回放/冲突）
   solver/
     core.py        数据结构、移液器可行性、最小批量
     options.py     候选方案（直接/双源/新中间液/逐级稀释链）
@@ -417,11 +496,13 @@ app/
     solve.py       solve() 入口、计划组装、独立校验、无解诊断
 examples/          request.json、inventory.json、inventory_stepwise.json、
                    curl.sh、inventory.sh、call_api.py、inventory_demo.py、
-                   recall.sh、recall_demo.py、stepwise.sh、stepwise_demo.py
+                   recall.sh、recall_demo.py、stepwise.sh、stepwise_demo.py、
+                   review.sh、review_demo.py
 tests/             smoke.py（求解器）、api_smoke.py（HTTP+幂等）、
                    test_api.py、test_solver.py、test_inventory.py（库存/并发）、
                    test_recall.py（召回/追踪/并发裁决）、
-                   test_stepwise.py（逐步登记/结案/中止/召回并发）
+                   test_stepwise.py（逐步登记/结案/中止/召回并发）、
+                   test_review.py（复核比对/幂等/拒绝/并发）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -517,3 +598,36 @@ Dockerfile, docker-compose.yml, requirements.txt
    `examples/stepwise_demo.py`（仅标准库）；新增 `tests/test_stepwise.py`
    （登记/重试/跳步/结案/中止、查询进度、召回阻断与已执行路径报告、
    召回/登记并发与同步骤并发幂等）；既有 68 个测试全部保持通过。
+
+---
+
+## 10. 本轮变动（执行差异复核）
+
+1. **新增执行差异复核**：`POST /inventory/plans/{request_id}/review`
+   （请求头 `X-Review-ID` 必填，请求体 `actual_transfers[]` 为全量有序实际转移
+   记录：步骤号、来源、目的、体积）与 `GET /reviews/{review_id}`；新增
+   `reviews` 表（启动时 `CREATE TABLE IF NOT EXISTS` 自动创建，无需手工迁移）。
+   仅**已结束**的库存计划可复核：整单模式 `confirmed`、逐步模式
+   `completed` / `aborted`；`reserved` / `stepwise` / `cancelled` 一律
+   `409 plan_not_ended`。
+2. **逐步比对与报告内容**：比对锚定冻结计划——每个冻结步骤给出
+   `matched` / `missing` / `content_mismatch`（附 `differences` 不一致字段），
+   冻结步骤之外的实际记录列为 `extra_records`；报告含每步匹配结果、
+   首个缺失/多余/内容不一致位置（`first_missing_step` / `first_extra_step` /
+   `first_mismatch_step`）、按批次的**冻结与实际库存转出汇总**
+   （`frozen_nl` / `actual_nl` / `difference_nl`，计划外批次 `frozen_nl` 为 0）
+   与计数汇总；报告一旦封存**不可变**。
+3. **只读语义**：复核只向 `reviews` 表写入，**不改库存、计划或已登记步骤**；
+   复核前后批次余额、冻结计划与逐步登记记录完全一致。
+4. **幂等与冲突**：同一复核编号 + 相同内容重试返回原报告（`200`，记录顺序
+   不影响内容判定——哈希前按步骤号归一化）；同号异内容（含换计划提交）
+   `409 idempotency_conflict`；并发同号提交恰好一个 `201` 封存，其余按内容
+   回放或冲突（`INSERT ... ON CONFLICT DO NOTHING` 首写胜出）。
+5. **整批拒绝且不留报告**：未知计划（`404`，含非库存计划与无解冻结的计划）、
+   未结束计划（`409 plan_not_ended`）、重复步骤号（`400 duplicate_step`）、
+   非法节点 kind / 非正体积 / 非法步骤号（`400`）——拒绝时不封存任何报告、
+   复核编号不被占用，修正后可用同一编号重新提交。
+6. **兼容性**：既有全部端点、状态码与幂等语义不变；`docker compose up`
+   启动方式与健康检查保持可用；新增 `examples/review.sh`、
+   `examples/review_demo.py`（仅标准库）与 `tests/test_review.py`
+   （比对/幂等/拒绝/只读/并发共 23 个用例），全部 124 个测试通过。

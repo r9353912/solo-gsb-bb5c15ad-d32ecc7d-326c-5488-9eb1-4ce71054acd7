@@ -36,6 +36,8 @@ class FakeStore:
         self.reservations = {}  # request_id -> {"status","mode","items",
         #                          "steps": {step: record}}
         self.recalls = {}       # batch_id -> {"reason", "report", ...}
+        self.reviews = {}       # review_id -> {"request_id", "content_hash",
+        #                          "report", "reviewed_at"}
 
     # -- batches ----------------------------------------------------------- #
 
@@ -328,6 +330,31 @@ class FakeStore:
         rec = self.recalls.get(batch_id)
         return dict(rec) if rec is not None else None
 
+    # -- reviews ------------------------------------------------------------- #
+
+    @staticmethod
+    def _review_pub(r):
+        return {"review_id": r["review_id"], "request_id": r["request_id"],
+                "reviewed_at": r["reviewed_at"], "report": r["report"]}
+
+    async def create_review(self, conn, review_id, request_id, content_hash,
+                            report):
+        # atomic: no awaits between the check and the insert
+        existing = self.reviews.get(review_id)
+        if existing is None:
+            existing = {"review_id": review_id, "request_id": request_id,
+                        "content_hash": content_hash, "report": report,
+                        "reviewed_at": "2026-01-01T00:00:00+00:00"}
+            self.reviews[review_id] = existing
+            return "ok", self._review_pub(existing)
+        outcome = ("replay" if existing["content_hash"] == content_hash
+                   else "conflict")
+        return outcome, self._review_pub(existing)
+
+    async def get_review(self, conn, review_id):
+        r = self.reviews.get(review_id)
+        return self._review_pub(r) if r is not None else None
+
 
 @pytest.fixture
 def store(monkeypatch):
@@ -352,6 +379,8 @@ def store(monkeypatch):
         ("abort_stepwise", st.abort_stepwise),
         ("recall_batch", st.recall_batch),
         ("get_recall", st.get_recall),
+        ("create_review", st.create_review),
+        ("get_review", st.get_review),
     ]
     for name, fn in pairs:
         monkeypatch.setattr(db, name, fn)

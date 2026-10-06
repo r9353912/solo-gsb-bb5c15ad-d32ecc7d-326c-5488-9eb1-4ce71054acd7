@@ -100,6 +100,15 @@ CREATE TABLE IF NOT EXISTS recalls (
     report          JSONB NOT NULL,
     recalled_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Sealed execution-variance review reports (immutable once written).
+CREATE TABLE IF NOT EXISTS reviews (
+    review_id       TEXT PRIMARY KEY,
+    request_id      TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    report          JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -1004,3 +1013,75 @@ async def get_recall(pool, batch_id: str):
             "recalled_at": row["recalled_at"].isoformat(),
             "report": json.loads(row["report"]),
         }
+
+
+# --------------------------------------------------------------------------- #
+# Execution-variance reviews
+# --------------------------------------------------------------------------- #
+
+
+async def create_review(pool, review_id: str, request_id: str,
+                        content_hash: str, report: dict):
+    """Seal an immutable execution-variance review report.
+
+    The review is pure bookkeeping: it never touches batches, reservations,
+    plans or step registrations. The first writer wins; a repeated or
+    concurrent submission with the same ``review_id`` never alters the
+    sealed row -- it is replayed (``"replay"``) when the content hash
+    matches and reported as ``"conflict"`` otherwise.
+
+    Returns ``(outcome, data)`` where outcome is ``"ok"`` / ``"replay"`` /
+    ``"conflict"`` and data is the sealed record
+    ``{review_id, request_id, reviewed_at, report}``.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO reviews (review_id, request_id, content_hash, report)
+            VALUES ($1, $2, $3, $4::jsonb)
+            ON CONFLICT (review_id) DO NOTHING
+            RETURNING created_at
+            """,
+            review_id, request_id, content_hash, json.dumps(report),
+        )
+        if row is not None:
+            return "ok", {
+                "review_id": review_id,
+                "request_id": request_id,
+                "reviewed_at": row["created_at"].isoformat(),
+                "report": report,
+            }
+        # Lost the insert race (or a plain retry): the conflicting INSERT
+        # waits for the winner to commit, so its row is visible afterwards.
+        existing = await conn.fetchrow(
+            "SELECT request_id, content_hash, report, created_at "
+            "FROM reviews WHERE review_id = $1",
+            review_id,
+        )
+        data = {
+            "review_id": review_id,
+            "request_id": existing["request_id"],
+            "reviewed_at": existing["created_at"].isoformat(),
+            "report": json.loads(existing["report"]),
+        }
+        outcome = ("replay" if existing["content_hash"] == content_hash
+                   else "conflict")
+        return outcome, data
+
+
+async def get_review(pool, review_id: str) -> Optional[dict]:
+    """Return the sealed review record, or ``None`` when it does not exist."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT request_id, report, created_at FROM reviews "
+            "WHERE review_id = $1",
+            review_id,
+        )
+    if row is None:
+        return None
+    return {
+        "review_id": review_id,
+        "request_id": row["request_id"],
+        "reviewed_at": row["created_at"].isoformat(),
+        "report": json.loads(row["report"]),
+    }
